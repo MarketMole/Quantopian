@@ -1,0 +1,383 @@
+import math
+import talib
+import numpy
+import pandas
+
+EnableLogging    = True
+MACDPeriodsSlow  = 26;      MACDPeriodsFast  = 12;   MACDPeriodsSignal= 9
+EntryTrigger     = 8
+HighHighPeriods  = 7
+HMAPeriods       = 7
+RSIPeriods       = 11
+LongMAPeriods    = 21
+VariancePeriods  = 11;      VarianceCutoff   = .2
+ExitPeriods      = 1000
+TrailingStopPct  = 2.0
+VolBiasPeriods   = 11;      VolBiasThreshold = .70
+MaxSecuritiesToTrade = 1
+
+def initialize(context):
+    set_symbol_lookup_date('2015-01-01')
+    #symbols('MMM','AXP','T','BA','CAT','CVX','CSCO','KO','DIS','DD','XOM','GE','GS','HD','IBM',
+    #        'JNJ','JPM','MCD','MRK','MSFT','NKE','PFE','PG','TRV','UTX','UNH','VZ','V','INTC','WMT')
+    context.ZZZ = symbol('SPY')
+    set_benchmark(context.ZZZ)
+    
+    # Establish state
+    schedule_function(EstablishState)
+    
+    # Calculate indicators
+    schedule_function(HighestHigh)
+    schedule_function(CalculateMACD)    
+    schedule_function(CalculateLongMA)
+    schedule_function(CalculateRSI)
+    schedule_function(CalculateHMA)
+    schedule_function(CalculateVolatilityVariance)
+    
+    # Handle exits
+    schedule_function(PeriodStop)
+    schedule_function(TrailingStop)
+    schedule_function(VolBiasProfitStop)
+    schedule_function(VolatilityStop)
+    
+    # Handle entries
+    schedule_function(HandleEntry)
+
+def handle_data(context, data):
+    record(Leveage = context.account.leverage)
+    if ('MACD' in data[context.ZZZ]):
+        record(MACD    = data[context.ZZZ].MACD)
+        record(Trigger = data[context.ZZZ].Trigger)
+    #    record(SMA   = data[context.ZZZ].SMA)
+    #    record(RSI   = data[context.ZZZ].RSI)
+    #    record(HMA   = data[context.ZZZ].HMA)
+    #    record(Close = data[context.ZZZ].close_price)        
+    #if ('VolBias' in data[context.ZZZ]):        
+    #    record(VolBias = data[context.ZZZ].VolBias)
+    
+    testDataDeck = history(200, "1d", "close_price")
+    for stock in data:
+        print("{0} Begin date:{1} first data avail:{2}".format(stock.symbol, stock.start_date, testDataDeck[stock].index[0]))
+    
+''''''''''''''''''''''''''''''''
+''''' Code block framework '''''
+''''''''''''''''''''''''''''''''
+    
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def HandleEntry(context, data):
+    eligible = []
+    positions = context.portfolio.positions
+    openPositions = [stock for stock in positions if positions[stock].amount != 0]
+    triggerTotal = sum([data[stock].Trigger for stock in data])
+    #if (triggerTotal < (len(data) * EntryTrigger) * .10):
+    #    print("TriggerTotal: {0} < {1}".format(triggerTotal, (len(data) * EntryTrigger) * .5))
+    #    return
+    for stock in data:
+        if (data[stock].Trigger <= EntryTrigger and stock not in openPositions):
+            eligible.append(stock)
+            
+    for stock in data:
+        if (data[stock].Trigger > EntryTrigger and stock in openPositions):
+            if (not get_open_orders(stock)):
+                order_target_percent(stock, 0)
+    
+    eligible += openPositions
+    eligibleCount = float(len(eligible))
+    for stock in eligible:
+        if (get_open_orders(stock)):
+            continue
+        order_target_percent(stock, 1.0 / eligibleCount)
+        data[stock].VolBiasDelay = VolBiasPeriods
+        PrintEntry(data[stock], "ThresholdEntry", stock.symbol)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~            
+def CalculateMACD(context, data):
+    closes = history(MACDPeriodsSlow + MACDPeriodsFast, "1d", "close_price").dropna(axis=1)
+    closes = closes[[sid for sid in closes if sid in data]]
+    for stock in closes:
+        macd, signal, hist = talib.MACD(closes[stock], MACDPeriodsFast, MACDPeriodsSlow, MACDPeriodsSignal)        
+        data[stock].MACD   = hist[-1]
+        data[stock].Trigger += 2 if hist[-1] > 0.0 else -1
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~            
+def HighestHigh(context, data):
+    highs    = history(HighHighPeriods, "1d", "high")
+    highs    = highs.dropna(axis=1)
+    valid    = [sid for sid in highs if sid in data]  
+    highs    = highs[valid]
+    for stock in highs:
+        data[stock].Trigger += 2 if data[stock].high == max(highs[stock]) else -1
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def CalculateLongMA(context, data):
+    closes   = history(LongMAPeriods, "1d", "close_price")
+    closes   = closes.dropna(axis=1)
+    valid    = [sid for sid in closes if sid in data]  
+    closes   = closes[valid]      
+    sma      = closes.apply(talib.MA, timeperiod = LongMAPeriods, matype = MAType.SMA).dropna()
+    for stock in sma:
+        data[stock].Trigger += 4 if data[stock].close_price > sma[stock][-1] else -1
+        data[stock].SMA = sma[stock][-1]
+    
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~    
+def CalculateRSI(context, data):
+    closes   = history(RSIPeriods + 2, "1d", "close_price")
+    closes   = closes.dropna(axis=1)
+    valid    = [sid for sid in closes if sid in data]
+    closes   = closes[valid]      
+    rsi      = closes.apply(talib.RSI, timeperiod = RSIPeriods).dropna()
+    for stock in rsi:
+        data[stock].Trigger += 3 if rsi[stock][-1] > rsi[stock][-2] and rsi[stock][-1] > 50 else -1
+        data[stock].RSI = rsi[stock][-1]
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def CalculateHMA(context, data):
+    closes   = history(HMAPeriods * 2, "1d", "close_price")
+    closes   = closes.dropna(axis=1)
+    valid    = [sid for sid in closes if sid in data]  
+    closes   = closes[valid]      
+    wmaA     = closes.apply(talib.MA,   timeperiod = HMAPeriods / 2, matype = MAType.WMA).dropna() * 2.0
+    wmaB     = closes.apply(talib.MA,   timeperiod = HMAPeriods, matype = MAType.WMA).dropna()
+    wmaDiffs = wmaA - wmaB
+    hma      = wmaDiffs.apply(talib.MA, timeperiod = math.sqrt(HMAPeriods), matype = MAType.WMA)
+    for stock in closes:
+        data[stock].Trigger += 2 if hma[stock][-1] > hma[stock][-2] else -1
+        data[stock].HMA = hma[stock][-1]
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def CalculateVolatilityVariance(context, data):
+    closesDeck     = history(VariancePeriods, '1d', 'close_price').dropna()
+    valid          = [sid for sid in closesDeck if sid in data]  
+    closesDeck     = closesDeck[valid]
+    returnsDeck    = closesDeck.pct_change()
+    returnsLog     = numpy.log1p(returnsDeck)
+    returnsLogMean = pandas.rolling_mean(returnsLog, 3)
+    sqrdLogDiffs   = (returnsLog - returnsLogMean)**2.0
+    sqrdLogDiffs   *= 1000.0
+    sqrdLogDiffs   = pandas.rolling_mean(sqrdLogDiffs, 7)
+    for stock in closesDeck:
+        if (not sqrdLogDiffs[stock].any() or len(sqrdLogDiffs[stock]) == 0):
+            continue
+        data[stock].Trigger += 2 if sqrdLogDiffs[stock][-1] < VarianceCutoff else -1           
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def PeriodStop(context, data):
+    for stock in data:
+        if (not data[stock].NetQuantity or data[stock].HasOpenOrders):
+            continue
+        if ('periodStop' not in data[stock]):
+            data[stock].periodStop = ExitPeriods
+            continue
+        data[stock].periodStop -= 1
+        if (data[stock].periodStop > 0):
+            continue
+        del data[stock].periodStop
+        if (data[stock].NetQuantity != 0):
+            order_target_percent(stock, 0.0)  
+            PrintExit(data[stock], "PeriodStop", stock.symbol)
+            
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                
+def VolBiasProfitStop(context, data):
+    opens  = history(VolBiasPeriods, "1d", "open_price").dropna(axis=1)
+    valid  = [sid for sid in opens if sid in data]  
+    opens  = opens[valid]
+    highs  = history(VolBiasPeriods, "1d", "high").dropna(axis=1)
+    highs  = highs[valid]
+    lows   = history(VolBiasPeriods, "1d", "low").dropna(axis=1)
+    lows   = lows[valid]
+    closes = history(VolBiasPeriods, "1d", "close_price").dropna(axis=1)
+    closes = closes[valid]
+    
+    for stock in opens:
+        if ('VolBiasDelay' in data[stock]): # Delay instated after we exited on profit last time
+            data[stock].VolBiasDelay -= 1
+            if (data[stock].VolBiasDelay > 0):
+                continue
+            del data[stock].VolBiasDelay
+        data[stock].VolBias = None
+        if (not data[stock].NetQuantity or data[stock].HasOpenOrders):
+            continue
+        upPortion = 0; dnPortion = 0
+        span = len(opens[stock])
+        for i in range(0, span):
+            if (closes[stock][i] > opens[stock][i]):
+                upPortion += (i + 1) * (highs[stock][i] - lows[stock][i])
+            else:
+                dnPortion += (i + 1) * (highs[stock][i] - lows[stock][i])
+        factor = upPortion / (upPortion + dnPortion)
+        data[stock].VolBias = factor
+        if (factor >= VolBiasThreshold):
+            data[stock].VolBiasDelay = VolBiasPeriods
+            order_target_percent(stock, 0.0)  
+            PrintExit(data[stock], "VolBiasProfitStop", stock.symbol)
+        
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def TrailingStop(context, data):
+    for stock in data:
+        if (not data[stock].NetQuantity or data[stock].HasOpenOrders):
+            continue
+        offset = (TrailingStopPct * data[stock].close_price) / 100.0
+        if ('trailingStop' not in data[stock]):
+            if (data[stock].NetQuantity > 0):
+                data[stock].trailingStop = data[stock].low - offset
+            else:
+                data[stock].trailingStop = data[stock].high + offset
+            continue
+        if (data[stock].NetQuantity > 0):
+            if (data[stock].close_price < data[stock].trailingStop):  
+                order_target_percent(stock, 0.0)  
+                PrintExit(data[stock], "TrailSellStop", stock.symbol)
+                del data[stock].trailingStop
+                continue
+            else:  
+                data[stock].trailingStop = max(data[stock].trailingStop, data[stock].low - offset) 
+        else:
+            if (data[stock].close_price > data[stock].trailingStop):  
+                order_target_percent(stock, 0.0)  
+                PrintExit(data[stock], "TrailCoverStop", stock.symbol)
+                del data[stock].trailingStop
+                continue
+            else:  
+                data[stock].trailingStop = max(data[stock].trailingStop, data[stock].high + offset) 
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def VolatilityStop(context, data):
+    closesDeck     = history(VariancePeriods, '1d', 'close_price').dropna()
+    valid          = [sid for sid in closesDeck if sid in data]  
+    closesDeck     = closesDeck[valid]
+    returnsDeck    = closesDeck.pct_change()
+    returnsLog     = numpy.log1p(returnsDeck)
+    returnsLogMean = pandas.rolling_mean(returnsLog, 3) #magic #s
+    sqrdLogDiffs   = (returnsLog - returnsLogMean)**2.0
+    sqrdLogDiffs   *= 1000.0
+    sqrdLogDiffs   = pandas.rolling_mean(sqrdLogDiffs, 7) #magic #s
+    for stock in closesDeck:
+        if (not data[stock].NetQuantity or data[stock].HasOpenOrders):
+            continue
+        if (not sqrdLogDiffs[stock].any() or len(sqrdLogDiffs[stock]) == 0):
+            continue
+        if (sqrdLogDiffs[stock][-1] > VarianceCutoff):
+            order_target_percent(stock, 0.0)  
+            PrintExit(data[stock], "VolatilityStop", stock.symbol)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def EstablishState(context, data):
+    for stock in data:
+        data[stock].Trigger       = 0
+        data[stock].NetQuantity   = context.portfolio.positions[stock].amount
+        data[stock].CostBasis     = context.portfolio.positions[stock].cost_basis
+        data[stock].HasOpenOrders = False
+        data[stock].OpenLimit     = None
+        data[stock].OpenStop      = None
+        if (get_open_orders(stock)):
+            data[stock].HasOpenOrders = True
+            for order in get_open_orders(stock):
+                if order.limit:
+                    data[stock].OpenLimit   = order
+                    data[stock].LimitLeaves = order.amount - order.filled
+                elif order.stop:
+                    data[stock].OpenStop    = order
+                    data[stock].StopLeaves  = order.amount - order.filled 
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def PrintEntry(dataStock, entryName, symbol):
+    if (not EnableLogging):
+        return
+    if (dataStock.NetQuantity == 0):
+        print(">> {0:<20}{1:<5} @ {2:>7.2f}".format(
+            entryName, symbol, dataStock.close_price))
+    else:
+        print("** {0:<20}{1:<5} @ {2:>7.2f} # {3:>5}".format(
+            entryName, symbol, dataStock.close_price, dataStock.NetQuantity))
+   
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def PrintExit(dataStock, exitName, symbol):
+    if (not EnableLogging):
+        return    
+    pnl = 0.0
+    if (dataStock.NetQuantity > 0):
+        pnl = dataStock.close_price - dataStock.CostBasis
+    else:
+        pnl = dataStock.CostBasis - dataStock.close_price
+        
+    print("<< {0:<20}{1:<5} @ {2:>7.2f} pnl {3:>6.2f}".format(
+            exitName, symbol, dataStock.close_price, pnl))
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class MAType():
+    SMA   = 0; EMA   = 1; WMA   = 2; DEMA  = 3; TEMA  = 4;    
+    TRIMA = 5; KAMA  = 6; MAMA  = 7; T3    = 8
+    
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def before_trading_start(context): 
+    f = fundamentals
+    
+    priceToBookFundy = get_fundamentals(
+        query(
+            f.valuation_ratios.pb_ratio
+        )
+        .filter(f.valuation_ratios.pb_ratio != None)
+        .filter(f.valuation.market_cap >= 10000000000)
+        .order_by(f.valuation.market_cap.desc())
+        .limit(1000)
+    )
+    
+    priceToEarningsFundy = get_fundamentals(
+        query(
+            f.valuation_ratios.pe_ratio
+        )
+        .filter(f.valuation_ratios.pe_ratio != None)
+        .filter(f.valuation.market_cap >= 10000000000)
+        .order_by(f.valuation.market_cap.desc())
+        .limit(1000)
+    )
+    
+    priceToSalesFundy = get_fundamentals(
+        query(
+            f.valuation_ratios.ps_ratio
+        )
+        .filter(f.valuation_ratios.ps_ratio != None)
+        .filter(f.valuation.market_cap >= 10000000000)
+        .order_by(f.valuation.market_cap.desc())
+        .limit(1000)
+    )
+    
+    # Perform the intersection which will give us the common securities 
+    fundySeries = pandas.Series(list(
+            set(priceToBookFundy).intersection(
+                set(priceToEarningsFundy).intersection(
+                    set(priceToSalesFundy)))))
+    
+    # Scale each fundamental metric from 0.0 -> 1.0
+    try:
+        priceToBookFundy     -= min(priceToBookFundy.min())
+        priceToBookFundy     /= max(priceToBookFundy.max())
+        priceToEarningsFundy -= min(priceToEarningsFundy.min())
+        priceToEarningsFundy /= max(priceToEarningsFundy.max())
+        priceToSalesFundy    -= min(priceToSalesFundy.min())
+        priceToSalesFundy    /= max(priceToSalesFundy.max())
+    except:
+        return
+    
+    # Subselect only the securities that are common
+    priceToBookFundy     = priceToBookFundy[fundySeries]
+    priceToEarningsFundy = priceToEarningsFundy[fundySeries]
+    priceToSalesFundy    = priceToSalesFundy[fundySeries]
+    
+    # Create composite dataframe with the n Values as row:columns
+    compositeDeck = priceToBookFundy.add(
+        priceToEarningsFundy, fill_value=0).add(
+            priceToSalesFundy, fill_value=0)
+
+    # Sum the n scaled values into a single value
+    compositeDeck = compositeDeck.sum(axis=0)
+    
+    # Rank largest to smallest and take the first X that show up
+    compositeDeck = compositeDeck.order(ascending = True)    
+    compositeDeck = compositeDeck[:MaxSecuritiesToTrade]
+    
+    # Save to context for use in selection later
+    context.securityRankDeck = compositeDeck
+    
+    #: Update our universe with the intersection of symbols
+    update_universe(compositeDeck.index)  
